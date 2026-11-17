@@ -1,0 +1,6 @@
+streamlit
+python-telegram-bot>=20.0
+gspread
+httpx
+python-dotenv
+tzdata
