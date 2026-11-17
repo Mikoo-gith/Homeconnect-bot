@@ -307,7 +307,7 @@ def path_len(start, order):
     return sum(hav(pts[i], pts[i + 1]) for i in range(len(pts) - 1))
 
 
-def optimize(start, items):
+def optimize_chain(start, items):
     """Mulai dari titik terdekat dengan start, lalu satu alur (nearest-neighbor + 2-opt)."""
     if len(items) <= 1:
         return items[:]
@@ -328,6 +328,38 @@ def optimize(start, items):
                 if path_len(start, new) + 1e-9 < path_len(start, order):
                     order, improved = new, True
     return order
+
+
+def optimize_with_outliers(start, items):
+    """Urutkan tiket yang saling berdekatan mulai dari awal dalam satu alur,
+    dan taruh tiket yang lokasinya mental jauh (tidak ada yang dekat) di paling bawah."""
+    if len(items) <= 2:
+        return optimize_chain(start, items), []
+
+    nn_dists = []
+    for t in items:
+        d_other = min(hav(t["coord"], o["coord"]) for o in items if o is not t)
+        nn_dists.append((d_other, t))
+
+    sorted_d = sorted(d for d, _ in nn_dists)
+    base_d = sorted_d[max(0, len(sorted_d) // 3 - 1)]
+    thresh = min(6.0, max(3.0, base_d * 2.5))
+
+    near = [t for d, t in nn_dists if d <= thresh]
+    far = [t for d, t in nn_dists if d > thresh]
+
+    if not near:
+        return optimize_chain(start, items), []
+
+    main_order = optimize_chain(start, near)
+    tail = main_order[-1]["coord"] if main_order else start
+    far_order = optimize_chain(tail, far)
+    return main_order, far_order
+
+
+def optimize(start, items):
+    main_order, far_order = optimize_with_outliers(start, items)
+    return main_order + far_order
 
 
 def maps_url(c):
@@ -353,13 +385,14 @@ def gmaps_links(start, order):
 
 def mark_of(t):
     s = t.get("status")
+    far_tag = "📌 JAUH " if t.get("is_far") else ""
     if s == "BARU":
-        return "🆕 BARU "
+        return f"{far_tag}🆕 BARU "
     if s == "LAMA":
-        return f"♻️ LAMA (sejak {t['since']}) "
+        return f"{far_tag}♻️ LAMA (sejak {t['since']}) "
     if s == "AKTIF":
-        return f"⏳ (sejak {t['since']}) "
-    return ""
+        return f"{far_tag}⏳ (sejak {t['since']}) "
+    return far_tag
 
 
 def date_key(x):
@@ -378,13 +411,16 @@ def build_report(items, start):
     blocks = []
     for d in sorted(groups, key=date_key):
         g = groups[d]
-        order = optimize(start, g)
+        main_order, far_order = optimize_with_outliers(start, g)
+        far_incs = {t["inc"] for t in far_order}
+        order = main_order + far_order
         paras = ["\n".join([
             f"📅 <b>{e(d)}</b> | {e(g[0]['jenis'])}",
             f"SA: {e(g[0]['sa'])} | PIC: {e(g[0]['pic'])}",
             f"Total {len(order)} tiket | ±{path_len(start, order):.1f} km (garis lurus)",
         ])]
         for n, t in enumerate(order, 1):
+            t["is_far"] = t["inc"] in far_incs
             murl = e(t.get("url") or maps_url(t["coord"]))
             wa = wa_link(t)
             links = f'🔗 <a href="{murl}">Buka Maps</a>'
@@ -403,6 +439,41 @@ def build_report(items, start):
         paras.append("\n".join(route))
         blocks.append("\n\n".join(paras))
     return blocks
+
+
+def build_aktif_report(items, start):
+    """Satu laporan gabungan untuk seluruh tiket aktif: urut berdekatan dari titik awal,
+    dan tiket yang lokasinya mental jauh ditaruh di paling bawah."""
+    e = html.escape
+    main_order, far_order = optimize_with_outliers(start, items)
+    far_incs = {t["inc"] for t in far_order}
+    order = main_order + far_order
+
+    info_far = f" ({len(main_order)} berdekatan, {len(far_order)} jauh)" if far_order else ""
+    paras = ["\n".join([
+        f"📋 <b>Rute Tiket Aktif</b>{e(info_far)}",
+        f"Total {len(order)} tiket | ±{path_len(start, order):.1f} km (garis lurus)",
+    ])]
+    for n, t in enumerate(order, 1):
+        t["is_far"] = t["inc"] in far_incs
+        murl = e(t.get("url") or maps_url(t["coord"]))
+        wa = wa_link(t)
+        links = f'🔗 <a href="{murl}">Buka Maps</a>'
+        if wa:
+            links += f' | 💬 <a href="{e(wa)}">Chat WA</a>'
+        paras.append("\n".join([
+            f"{n}. {e(mark_of(t))}<b>{e(t['inc'])}</b> | {e(t['odp'])}",
+            f"   📅 {e(t['ticket_date'])} | {e(t['jenis'])}",
+            f"   🧾 Layanan: {e(t.get('layanan') or '-')}",
+            f"   👤 {e(t['name'])} ({e(t['phone'])})",
+            f"   📍 {e(t['address'])}",
+            f"   {links}",
+        ]))
+    route = ["🗺️ <b>Rute sekali jalan</b> (mulai dari titik awal):"]
+    for a_, b_, u in gmaps_links(start, order):
+        route.append(f'• <a href="{e(u)}">Stop {a_}-{b_}</a>')
+    paras.append("\n".join(route))
+    return "\n\n".join(paras)
 
 
 # ================================================================ konversi data sheet
@@ -767,8 +838,7 @@ async def show_aktif(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         async with httpx.AsyncClient(headers=UA) as client:
             start = await get_start(client)
-        for b in build_report(items, start):
-            await send_long(msg, b, html_mode=True)
+        await send_long(msg, build_aktif_report(items, start), html_mode=True)
     except Exception as e:
         log.exception("aktif gagal")
         await msg.reply_text(f"❌ Error /aktif: {e}")
