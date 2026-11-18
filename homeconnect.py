@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import re
+import statistics
 from datetime import datetime
 from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo
@@ -43,9 +44,9 @@ MAX_TICKETS = int(env("MAX_TICKETS", "40"))
 STOPS_PER_LINK = min(int(env("STOPS_PER_LINK", "10")), 10)  # 9 waypoint + 1 tujuan
 TZ = ZoneInfo(env("TIMEZONE", "Asia/Jakarta"))
 ALLOWED = [int(x) for x in env("ALLOWED_USER_IDS").split(",") if x.strip()]
-PETUGAS_NAMA = env("PETUGAS_NAMA")
+PETUGAS_NAMA = env("PETUGAS_NAMA", "Jatmiko Satrio Wibowo")
 PETUGAS_NIK = env("PETUGAS_NIK")
-PERUSAHAAN = env("PERUSAHAAN")
+PERUSAHAAN = env("PERUSAHAAN", "Telkomsel Indihome")
 CLOSE_KETERANGAN = env("CLOSE_KETERANGAN", "DONE DAN SCC")
 
 if not BOT_TOKEN or not SHEET_ID or not ALLOWED:
@@ -103,27 +104,35 @@ class Store:
         if logs:
             self.log.append_rows(logs, value_input_option="RAW")
 
-    def close(self, incs, now):
-        """Pindahkan dari Aktif ke Selesai. Return (data tiket, INC tidak ditemukan, sisa aktif)."""
+    def close(self, incs, now, addr_overrides=None):
+        """Pindahkan dari Aktif ke Selesai. Return (data tiket, INC tidak ditemukan, sisa aktif dict)."""
         aktif = self.load_aktif()
-        found = [aktif[i] for i in incs if i in aktif]
+        addr_overrides = addr_overrides or {}
+        found = []
+        for i in incs:
+            if i in aktif:
+                d = dict(aktif[i])
+                if i in addr_overrides and addr_overrides[i]:
+                    d["alamat"] = addr_overrides[i]
+                found.append(d)
         missing = [i for i in incs if i not in aktif]
         if found:
             rows = [[dict(d, closed_at=now).get(h, "") for h in HEADERS_SELESAI] for d in found]
             self.selesai.append_rows(rows, value_input_option="RAW")
             for d in sorted(found, key=lambda x: -x["row"]):
                 self.aktif.delete_rows(d["row"])
+                aktif.pop(d["inc"], None)
             self.log.append_rows(
                 [[now, d["inc"], "SELESAI", d["ticket_date"]] for d in found],
                 value_input_option="RAW",
             )
-        return found, missing, len(aktif) - len(found)
+        return found, missing, aktif
 
 
 store: Store = None
 
 
-# ================================================================ parsing
+# ================================================================ parsing & geocoding
 COORD_PATTERNS = [
     r"[?&](?:q|ll|query|destination|center)=(-?\d+\.\d+)(?:,|%2C)(-?\d+\.\d+)",
     r"@(-?\d+\.\d+),(-?\d+\.\d+)",
@@ -138,6 +147,22 @@ def extract_coord(text):
         if m:
             return float(m.group(1)), float(m.group(2))
     return None
+
+
+def extract_gmaps_place_name(url):
+    """Ambil nama jalan/perumahan dari URL Google Maps /maps/place/<nama>/ jika tersedia."""
+    if not url:
+        return ""
+    u = unquote(url)
+    m = re.search(r"/maps/place/([^/@?]+)", u)
+    if not m:
+        return ""
+    raw = m.group(1).replace("+", " ").strip()
+    if re.match(r"^-?\d+\.\d+\s*,\s*-?\d+\.\d+$", raw):
+        return ""
+    if re.search(r"\d+°\d+'\d+", raw):
+        return ""
+    return raw
 
 
 async def resolve_coord(client, url):
@@ -217,18 +242,113 @@ def parse_input(text, default_date):
     return tickets
 
 
-async def reverse_geocode(client, lat, lng):
-    """Alamat lengkap via OpenStreetMap Nominatim (batas 1 request/detik)."""
-    try:
-        r = await client.get(
-            "https://nominatim.openstreetmap.org/reverse", headers=GEO_UA, timeout=20,
-            params={"format": "jsonv2", "lat": lat, "lon": lng, "zoom": 18, "accept-language": "id"},
-        )
-        addr = r.json().get("display_name") or "(alamat tidak ditemukan)"
-    except Exception:
-        addr = "(alamat tidak ditemukan)"
-    await asyncio.sleep(1.1)
-    return addr
+def needs_full_address(addr):
+    """True jika alamat kosong atau tidak mencantumkan nama jalan / nama perumahan."""
+    a = (addr or "").strip().lower()
+    if not a or a in ("-", "(alamat tidak ditemukan)"):
+        return True
+    has_detail = bool(re.search(
+        r"\b(jl\.?|jalan|perum\.?|perumahan|gg\.?|gang|komp\.?|komplek|blok|cluster|raya|kav\.?|residences?|villa|griya|bukit|taman|pesona|pondok)\b",
+        a,
+    ))
+    return not has_detail
+
+
+def _format_nominatim(data, url_place=""):
+    addr = data.get("address") or {}
+    place = (data.get("name") or "").strip()
+    if re.match(r"^(rw|rt)\b", place, re.I):
+        place = ""
+
+    road = (
+        addr.get("road")
+        or addr.get("pedestrian")
+        or addr.get("footway")
+        or addr.get("path")
+        or addr.get("street")
+        or ""
+    ).strip()
+    house_no = (addr.get("house_number") or "").strip()
+    if road and house_no and house_no not in road:
+        road = f"{road} No. {house_no}"
+
+    residential = (
+        addr.get("residential")
+        or addr.get("allotments")
+        or addr.get("estate")
+        or addr.get("complex")
+        or ""
+    ).strip()
+
+    neighbourhood = (
+        addr.get("neighbourhood")
+        or addr.get("quarter")
+        or addr.get("hamlet")
+        or ""
+    ).strip()
+    village = (addr.get("suburb") or addr.get("village") or addr.get("town_district") or "").strip()
+    district = (addr.get("city_district") or addr.get("district") or "").strip()
+    city = (
+        addr.get("city")
+        or addr.get("town")
+        or addr.get("municipality")
+        or addr.get("county")
+        or ""
+    ).strip()
+    state = (addr.get("state") or "").strip()
+    postcode = (addr.get("postcode") or "").strip()
+
+    parts = []
+    for item in (url_place, place, residential, road, neighbourhood, village, district, city, state, postcode):
+        if not item:
+            continue
+        low = item.lower()
+        if any(low == p.lower() or low in p.lower() for p in parts):
+            continue
+        parts.append(item)
+
+    if parts:
+        return ", ".join(parts)
+    return (data.get("display_name") or "").strip()
+
+
+async def reverse_geocode(client, lat, lng, maps_link=""):
+    """Alamat lengkap beserta nama jalan / perumahan via OpenStreetMap Nominatim."""
+    url_place = extract_gmaps_place_name(maps_link)
+    if not url_place and maps_link and "maps.google" not in maps_link and "google.com/maps" not in maps_link:
+        try:
+            r_redir = await client.get(maps_link, follow_redirects=True, timeout=15)
+            url_place = extract_gmaps_place_name(str(r_redir.url))
+        except Exception:
+            pass
+
+    best_addr = ""
+    for zoom in (18, 17, 16):
+        try:
+            r = await client.get(
+                "https://nominatim.openstreetmap.org/reverse",
+                headers=GEO_UA,
+                timeout=20,
+                params={
+                    "format": "jsonv2",
+                    "lat": lat,
+                    "lon": lng,
+                    "zoom": zoom,
+                    "addressdetails": 1,
+                    "accept-language": "id",
+                },
+            )
+            data = r.json()
+            cand = _format_nominatim(data, url_place=url_place)
+            if cand and (not best_addr or len(cand) > len(best_addr)):
+                best_addr = cand
+            await asyncio.sleep(1.1)
+            if best_addr and not needs_full_address(best_addr):
+                break
+        except Exception:
+            await asyncio.sleep(1.1)
+
+    return best_addr or url_place or "(alamat tidak ditemukan)"
 
 
 _start_cache = None
@@ -263,10 +383,11 @@ def norm_phone(p):
 
 
 def wa_text(t):
-    asal = f" dari {PERUSAHAAN}" if PERUSAHAAN else ""
+    nama = PETUGAS_NAMA or "Jatmiko Satrio Wibowo"
+    perusahaan = PERUSAHAAN or "Telkomsel Indihome"
     return (
-        f"Semangat siang Bpk/Ibu {t['name']}, Untuk nomor layanan {t.get('layanan') or '-'} berikut. "
-        f"Perkenalkan saya {PETUGAS_NAMA}{asal}, saya dapat tugas untuk "
+        f"Semangat pagi Bpk/Ibu {t['name']}, Untuk nomor layanan {t.get('layanan') or '-'} berikut. "
+        f"Perkenalkan saya {nama} dari {perusahaan}, saya dapat tugas untuk "
         f"pengecekan layanan dan pemetaan pelanggan ke lokasi Bpk/Ibu hari ini dengan tiket "
         f"{t['inc']}. Terimakasih"
     )
@@ -294,7 +415,7 @@ def close_template(d):
     )
 
 
-# ================================================================ routing
+# ================================================================ routing & clustering
 def hav(a, b):
     R = 6371.0
     la1, lo1, la2, lo2 = map(math.radians, (*a, *b))
@@ -308,7 +429,11 @@ def path_len(start, order):
 
 
 def optimize_chain(start, items):
-    """Mulai dari titik terdekat dengan start, lalu satu alur (nearest-neighbor + 2-opt)."""
+    """
+    Mulai dari titik paling dekat dengan start, lalu lanjut ke titik paling dekat
+    dengan titik sebelumnya, dan haluskan jalur dengan 2-opt agar menjadi 1 jalur
+    tanpa tumpang tindih atau bolak-balik.
+    """
     if len(items) <= 1:
         return items[:]
     first = min(items, key=lambda t: hav(start, t["coord"]))
@@ -330,36 +455,62 @@ def optimize_chain(start, items):
     return order
 
 
-def optimize_with_outliers(start, items):
-    """Urutkan tiket yang saling berdekatan mulai dari awal dalam satu alur,
-    dan taruh tiket yang lokasinya mental jauh (tidak ada yang dekat) di paling bawah."""
+def cluster_and_route(start, items):
+    """
+    1. Scan semua koordinat tiket.
+    2. Kelompokkan tiket yang saling berdekatan vs yang lokasinya mental jauh banget.
+    3. Dari kelompok berdekatan, titik paling dekat dengan start menjadi titik #1 setelah rumah,
+       lalu lanjut titik paling dekat dari titik sebelumnya (1 jalur tanpa tumpang tindih/bolak-balik).
+    4. Tiket yang lokasinya mental jauh banget ditaruh di paling bawah.
+    """
     if len(items) <= 2:
         return optimize_chain(start, items), []
 
-    nn_dists = []
-    for t in items:
-        d_other = min(hav(t["coord"], o["coord"]) for o in items if o is not t)
-        nn_dists.append((d_other, t))
+    n = len(items)
+    nn_dists = [
+        min(hav(items[i]["coord"], items[j]["coord"]) for j in range(n) if i != j)
+        for i in range(n)
+    ]
+    med_nn = statistics.median(nn_dists)
+    radius = min(5.5, max(3.5, med_nn * 2.5))
 
-    sorted_d = sorted(d for d, _ in nn_dists)
-    base_d = sorted_d[max(0, len(sorted_d) // 3 - 1)]
-    thresh = min(6.0, max(3.0, base_d * 2.5))
+    visited = [False] * n
+    clusters = []
+    for i in range(n):
+        if visited[i]:
+            continue
+        comp = []
+        stack = [i]
+        visited[i] = True
+        while stack:
+            u = stack.pop()
+            comp.append(items[u])
+            for v in range(n):
+                if not visited[v] and hav(items[u]["coord"], items[v]["coord"]) <= radius:
+                    visited[v] = True
+                    stack.append(v)
+        clusters.append(comp)
 
-    near = [t for d, t in nn_dists if d <= thresh]
-    far = [t for d, t in nn_dists if d > thresh]
+    clusters.sort(key=lambda c: (-len(c), min(hav(start, t["coord"]) for t in c)))
+    main_cluster = clusters[0]
+    far_items = [t for c in clusters[1:] for t in c]
 
-    if not near:
+    if len(main_cluster) == 1 and n >= 3:
+        d_starts = sorted(hav(start, t["coord"]) for t in items)
+        med_start = statistics.median(d_starts)
+        far_thresh = max(8.0, med_start * 2.2)
+        near = [t for t in items if hav(start, t["coord"]) <= far_thresh]
+        far = [t for t in items if hav(start, t["coord"]) > far_thresh]
+        if near:
+            main_order = optimize_chain(start, near)
+            tail = main_order[-1]["coord"]
+            return main_order, optimize_chain(tail, far)
         return optimize_chain(start, items), []
 
-    main_order = optimize_chain(start, near)
+    main_order = optimize_chain(start, main_cluster)
     tail = main_order[-1]["coord"] if main_order else start
-    far_order = optimize_chain(tail, far)
+    far_order = optimize_chain(tail, far_items)
     return main_order, far_order
-
-
-def optimize(start, items):
-    main_order, far_order = optimize_with_outliers(start, items)
-    return main_order + far_order
 
 
 def maps_url(c):
@@ -403,7 +554,7 @@ def date_key(x):
 
 
 def build_report(items, start):
-    """Laporan per tanggal (HTML Telegram). Tiap bagian/tiket dipisah 1 baris kosong."""
+    """Laporan per tanggal saat add_tiket (HTML Telegram)."""
     e = html.escape
     groups = {}
     for t in items:
@@ -411,7 +562,7 @@ def build_report(items, start):
     blocks = []
     for d in sorted(groups, key=date_key):
         g = groups[d]
-        main_order, far_order = optimize_with_outliers(start, g)
+        main_order, far_order = cluster_and_route(start, g)
         far_incs = {t["inc"] for t in far_order}
         order = main_order + far_order
         paras = ["\n".join([
@@ -442,10 +593,10 @@ def build_report(items, start):
 
 
 def build_aktif_report(items, start):
-    """Satu laporan gabungan untuk seluruh tiket aktif: urut berdekatan dari titik awal,
-    dan tiket yang lokasinya mental jauh ditaruh di paling bawah."""
+    """Satu laporan gabungan seluruh tiket aktif: kelompok berdekatan mulai dari titik awal
+    dalam 1 jalur tanpa tumpang tindih, dan tiket mental jauh di paling bawah."""
     e = html.escape
-    main_order, far_order = optimize_with_outliers(start, items)
+    main_order, far_order = cluster_and_route(start, items)
     far_incs = {t["inc"] for t in far_order}
     order = main_order + far_order
 
@@ -511,6 +662,26 @@ def row_to_item(a):
     }
 
 
+def get_ordered_aktif_items(aktif_dict, start):
+    """Kembalikan list item terurut (1..N) sesuai rute berdekatan + outlier di bawah."""
+    items = []
+    for a in aktif_dict.values():
+        try:
+            it = row_to_item(a)
+            it["status"] = "AKTIF"
+            items.append(it)
+        except Exception:
+            continue
+    if not items:
+        return []
+    main_order, far_order = cluster_and_route(start, items)
+    far_incs = {t["inc"] for t in far_order}
+    order = main_order + far_order
+    for t in order:
+        t["is_far"] = t["inc"] in far_incs
+    return order
+
+
 # ================================================================ pipeline
 async def process(tickets):
     now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -551,7 +722,7 @@ async def process(tickets):
             if t["coord"]:
                 t["status"] = "BARU"
                 t["since"] = datetime.now(TZ).strftime("%d-%m-%Y")
-                t["address"] = await reverse_geocode(client, *t["coord"])
+                t["address"] = await reverse_geocode(client, *t["coord"], t.get("url", ""))
                 items.append(t)
 
     new_rows, updates, logs = [], [], []
@@ -740,7 +911,20 @@ async def add_process(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ---- close ticket
-def active_list_text(aktif):
+def active_list_text(aktif, start=None):
+    if start:
+        order = get_ordered_aktif_items(aktif, start)
+        if order:
+            parts = []
+            for n, t in enumerate(order, 1):
+                tag = "📌 JAUH | " if t.get("is_far") else ""
+                parts.append(
+                    f"{n}. {tag}/{t['inc'].strip()}\n"
+                    f"👤 {t['name']} | {t['odp']}\n"
+                    f"📍 {t['address']}"
+                )
+            return "\n\n".join(parts)
+
     groups = {}
     for a in aktif.values():
         d = norm_date(a["ticket_date"], norm_date(a["received_at"], "-"))
@@ -763,12 +947,18 @@ async def close_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not aktif:
         await update.message.reply_text("Tidak ada tiket aktif.", reply_markup=MAIN_KB)
         return ConversationHandler.END
+    start = None
+    try:
+        async with httpx.AsyncClient(headers=UA) as client:
+            start = await get_start(client)
+    except Exception:
+        pass
     await update.message.reply_text(
-        f"📋 {len(aktif)} tiket aktif\n\n"
+        f"📋 {len(aktif)} tiket aktif (urut rute dari rumah)\n\n"
         "Tap INC berwarna biru untuk menutup tiket, atau ketik nomor INC manual "
         "(boleh banyak).\n\nBatal: /cancel"
     )
-    await send_long(update.message, active_list_text(aktif))
+    await send_long(update.message, active_list_text(aktif, start))
     return CLOSE_WAIT
 
 
@@ -779,7 +969,30 @@ async def close_receive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return CLOSE_WAIT
     now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
     try:
-        found, missing, sisa = await asyncio.to_thread(store.close, incs, now)
+        aktif_now = await asyncio.to_thread(store.load_aktif)
+        addr_overrides = {}
+        start = None
+        async with httpx.AsyncClient(headers=UA) as client:
+            try:
+                start = await get_start(client)
+            except Exception:
+                pass
+            for inc in incs:
+                if inc not in aktif_now:
+                    continue
+                row = aktif_now[inc]
+                if needs_full_address(row.get("alamat", "")):
+                    coord = None
+                    try:
+                        coord = (to_float(row["lat"]), to_float(row["lng"]))
+                    except ValueError:
+                        coord = await resolve_coord(client, row.get("link_maps", ""))
+                    if coord:
+                        full_addr = await reverse_geocode(client, *coord, row.get("link_maps", ""))
+                        if full_addr and full_addr != "(alamat tidak ditemukan)":
+                            addr_overrides[inc] = full_addr
+
+        found, missing, sisa_aktif = await asyncio.to_thread(store.close, incs, now, addr_overrides)
     except Exception as e:
         log.exception("close gagal")
         await update.message.reply_text(f"❌ Error: {e}", reply_markup=MAIN_KB)
@@ -787,7 +1000,13 @@ async def close_receive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     status = []
     if found:
-        status.append(f"✅ {', '.join(d['inc'] for d in found)} dipindah ke tab Selesai.\nSisa tiket aktif: {sisa}")
+        msg_done = f"✅ {', '.join(d['inc'] for d in found)} dipindah ke tab Selesai.\nSisa tiket aktif: {len(sisa_aktif)}"
+        if sisa_aktif and start:
+            next_order = get_ordered_aktif_items(sisa_aktif, start)
+            if next_order:
+                nxt = next_order[0]
+                msg_done += f"\n\n➡️ Lanjut #1 berikutnya: /{nxt['inc']} — {nxt['name']}\n📍 {nxt['address']}"
+        status.append(msg_done)
     if missing:
         status.append("⚠️ Tidak ada di tiket aktif: " + ", ".join(missing))
     await update.message.reply_text("\n\n".join(status), reply_markup=MAIN_KB)
