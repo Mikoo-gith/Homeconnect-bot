@@ -1027,16 +1027,25 @@ def _route_km_from_matrix(start, order, pts_map, dist):
 
 def _format_ticket_entry(n, t, include_date=False):
     e = html.escape
+    no_loc = t.get("coord") is None
     wa = wa_link(t)
+    num_wa = norm_phone(t.get("phone"))
     link_parts = []
-    if t.get("coord") is not None:
+    if not no_loc:
         murl = e(t.get("url") or maps_url(t["coord"]))
         link_parts.append(f'🔗 <a href="{murl}">Buka Maps</a>')
     elif t.get("url"):
         link_parts.append(f'🔗 <a href="{e(t["url"])}">Buka Maps</a>')
+    else:
+        link_parts.append("⚠️ Belum ada link lokasi")
+
     if wa:
-        link_parts.append(f'💬 <a href="{e(wa)}">Chat WA</a>')
-    links = " | ".join(link_parts) if link_parts else "⚠️ Belum ada link lokasi"
+        wa_label = f"wa.me/{e(num_wa)}" if no_loc else "Chat WA"
+        link_parts.append(f'💬 <a href="{e(wa)}">{wa_label}</a>')
+    elif no_loc:
+        link_parts.append("⚠️ Nomor WA kosong")
+
+    links = " | ".join(link_parts)
 
     lines = [f"{n}. {e(mark_of(t))}<b>{e(t['inc'])}</b> | {e(t['odp'])}"]
     if include_date:
@@ -1047,6 +1056,8 @@ def _format_ticket_entry(n, t, include_date=False):
         f"   📍 {e(t['address'])}",
         f"   {links}",
     ])
+    if no_loc:
+        lines.append(f"   📝 Template WA: <code>{e(wa_text(t))}</code>")
     return "\n".join(lines)
 
 
@@ -1086,10 +1097,12 @@ def build_report(items, start, dist_matrices=None, is_fallback=False):
         paras = ["\n".join(head_lines)]
 
         num = 1
-        for t in no_loc:
-            t["is_far"] = False
-            paras.append(_format_ticket_entry(num, t, include_date=False))
-            num += 1
+        if no_loc:
+            paras.append(f"❓ <b>CP Tanpa Lokasi ({len(no_loc)} tiket — hubungi via WA dulu)</b>")
+            for t in no_loc:
+                t["is_far"] = False
+                paras.append(_format_ticket_entry(num, t, include_date=False))
+                num += 1
 
         prev_idx = 0
         for c_idx, cl in enumerate(clusters_meta, 1):
@@ -1141,10 +1154,12 @@ def build_aktif_report(items, start, dist_matrix=None, is_fallback=False):
     paras = ["\n".join(head_lines)]
 
     num = 1
-    for t in no_loc:
-        t["is_far"] = False
-        paras.append(_format_ticket_entry(num, t, include_date=True))
-        num += 1
+    if no_loc:
+        paras.append(f"❓ <b>CP Tanpa Lokasi ({len(no_loc)} tiket — hubungi via WA dulu)</b>")
+        for t in no_loc:
+            t["is_far"] = False
+            paras.append(_format_ticket_entry(num, t, include_date=True))
+            num += 1
 
     prev_idx = 0
     for c_idx, cl in enumerate(clusters_meta, 1):
@@ -1541,7 +1556,7 @@ def split_text(text, limit=3900, html_mode=False, max_entities=80):
         return len(html.unescape(re.sub(r"<[^>]+>", "", x))) if html_mode else len(x)
 
     def ents(x):
-        return len(re.findall(r"<(?:a|b)[ >]", x)) if html_mode else 0
+        return len(re.findall(r"<(?:a|b|code)[ >]", x)) if html_mode else 0
 
     def fits(x):
         return size(x) <= limit and ents(x) <= max_entities
@@ -1682,8 +1697,11 @@ async def add_process(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ))
     if failed:
         extra.append("\n".join(
-            ["❓ Tiket tanpa koordinat (tetap masuk Aktif di urutan atas & dicatat di Kendala):"]
-            + [f"- {t['inc']} ({t['url'] or 'tanpa link'})" for t in failed]
+            ["❓ Tiket tanpa koordinat (sudah ditaruh paling atas & masuk /kendala):"]
+            + [
+                f"- {t['inc']} | {t['name']} ({t['phone']}) | {wa_link(t) or 'No WA kosong'}"
+                for t in failed
+            ]
         ))
     if open_kendala:
         extra.append("\n".join(
@@ -1698,19 +1716,28 @@ async def add_process(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---- close ticket
 def _format_close_list(order):
+    e = html.escape
     parts = []
     for n, t in enumerate(order, 1):
+        no_loc = t.get("coord") is None
         tags = []
-        if t.get("coord") is None:
+        if no_loc:
             tags.append("❓ LOKASI KOSONG")
         if t.get("is_far"):
             tags.append("📌 JAUH")
         tag_str = f"{' | '.join(tags)} | " if tags else ""
-        parts.append(
-            f"{n}. {tag_str}/{t['inc'].strip()}\n"
-            f"👤 {t['name']} | {t['odp']}\n"
-            f"📍 {t['address']}"
-        )
+        lines = [
+            f"{n}. {e(tag_str)}/{e(t['inc'].strip())}",
+            f"👤 {e(t['name'])} ({e(t['phone'])}) | {e(t['odp'])}",
+            f"📍 {e(t['address'])}",
+        ]
+        if no_loc:
+            wa = wa_link(t)
+            num_wa = norm_phone(t.get("phone"))
+            if wa:
+                lines.append(f'💬 <a href="{e(wa)}">wa.me/{e(num_wa)}</a>')
+            lines.append(f"📝 Template WA: <code>{e(wa_text(t))}</code>")
+        parts.append("\n".join(lines))
     return "\n\n".join(parts)
 
 
@@ -1739,7 +1766,7 @@ async def close_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "(boleh banyak).\n\nBatal: /cancel"
     )
     if order:
-        await send_long(update.message, _format_close_list(order))
+        await send_long(update.message, _format_close_list(order), html_mode=True)
     else:
         groups = {}
         for a in aktif.values():
@@ -1841,7 +1868,7 @@ async def show_aktif(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             it = row_to_item(a)
             it["status"] = "AKTIF"
             items.append(it)
-        await msg.reply_text(f"📋 {len(items)} tiket aktif:")
+        await msg.reply_text(f"📋 {len(items)} tiket aktif:", reply_markup=MAIN_KB)
         async with httpx.AsyncClient(headers=UA) as client:
             start = await get_start(client)
             located = [t for t in items if t.get("coord") is not None]
@@ -1849,10 +1876,15 @@ async def show_aktif(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if located:
                 pts = [start] + [t["coord"] for t in located]
                 dm, fb = await road_matrix(client, pts)
-        await send_long(msg, build_aktif_report(items, start, dist_matrix=dm, is_fallback=fb), html_mode=True)
+        await send_long(
+            msg,
+            build_aktif_report(items, start, dist_matrix=dm, is_fallback=fb),
+            html_mode=True,
+            reply_markup=MAIN_KB,
+        )
     except Exception as e:
         log.exception("aktif gagal")
-        await msg.reply_text(f"❌ Error /aktif: {e}")
+        await msg.reply_text(f"❌ Error /aktif: {e}", reply_markup=MAIN_KB)
 
 
 # ---- kendala
@@ -1915,23 +1947,41 @@ async def show_kendala(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             det = d.get("detail") or "-"
             link = (d.get("link_maps") or "").strip()
             tap_inc = f"/{inc}" if inc != "-" and inc in aktif_map else inc
-            link_line = (
-                f'   🔗 <a href="{e(link)}">Cek Link Mentah</a>'
-                if link and link != "-"
-                else "   🔗 Link lokasi: <i>tidak ada</i>"
-            )
-            paras.append("\n".join([
+
+            t_obj = {
+                "inc": inc,
+                "name": d.get("nama") or "-",
+                "phone": d.get("telepon") or "-",
+                "layanan": d.get("layanan") or "-",
+            }
+            wa = wa_link(t_obj)
+            num_wa = norm_phone(t_obj["phone"])
+
+            action_parts = []
+            if link and link != "-":
+                action_parts.append(f'🔗 <a href="{e(link)}">Cek Link Mentah</a>')
+            else:
+                action_parts.append("⚠️ Tanpa link lokasi")
+            if wa:
+                action_parts.append(f'💬 <a href="{e(wa)}">wa.me/{e(num_wa)}</a>')
+            else:
+                action_parts.append("⚠️ Nomor WA kosong")
+
+            entry_lines = [
                 f"{n}. <b>{e(tap_inc)}</b> | {e(d.get('odp') or '-')}",
                 f"   ⚠️ <b>{e(jk)}</b>: {e(det)}",
-                f"   📅 {e(norm_date(d.get('ticket_date', ''), '-'))} | Layanan: {e(d.get('layanan') or '-')}",
-                f"   👤 {e(d.get('nama') or '-')} ({e(d.get('telepon') or '-')})",
-                link_line,
-            ]))
+                f"   📅 {e(norm_date(d.get('ticket_date', ''), '-'))} | Layanan: {e(t_obj['layanan'])}",
+                f"   👤 {e(t_obj['name'])} ({e(t_obj['phone'])})",
+                f"   {' | '.join(action_parts)}",
+            ]
+            if wa:
+                entry_lines.append(f"   📝 Template WA: <code>{e(wa_text(t_obj))}</code>")
+            paras.append("\n".join(entry_lines))
 
-        await send_long(msg, "\n\n".join(paras), html_mode=True)
+        await send_long(msg, "\n\n".join(paras), html_mode=True, reply_markup=MAIN_KB)
     except Exception as err:
         log.exception("kendala gagal")
-        await msg.reply_text(f"❌ Error /kendala: {err}")
+        await msg.reply_text(f"❌ Error /kendala: {err}", reply_markup=MAIN_KB)
 
 
 async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
