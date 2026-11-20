@@ -578,7 +578,7 @@ def wa_text(t):
     return (
         f"Semangat pagi Bpk/Ibu {t['name']}, Untuk nomor layanan {t.get('layanan') or '-'} berikut. "
         f"Perkenalkan saya {nama} dari {perusahaan}, saya dapat tugas untuk "
-        f"pengecekan layanan dan pemetaan pelanggan ke lokasi Bpk/Ibu hari ini dengan tiket "
+        f"pengecekan layanan WiFi dan pemetaan lokasi pelanggan ke rumah Bpk/Ibu hari ini dengan tiket "
         f"{t['inc']}. Terimakasih"
     )
 
