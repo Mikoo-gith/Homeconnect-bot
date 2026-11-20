@@ -4,11 +4,13 @@ Jalankan: python homeconnect.py (konfigurasi di file .env atau Streamlit Secrets
 """
 import asyncio
 import html
+import json
 import logging
 import math
 import os
 import re
 import statistics
+import threading
 from datetime import datetime
 from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo
@@ -18,7 +20,7 @@ import httpx
 from dotenv import load_dotenv
 from gspread.utils import rowcol_to_a1
 from telegram import (
-    InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update,
+    BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -29,6 +31,32 @@ from telegram.ext import (
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tiketbot")
+
+
+def _load_streamlit_secrets():
+    """Sinkronkan st.secrets ke os.environ & tulis credentials.json jika berjalan di Streamlit Cloud."""
+    try:
+        import streamlit as st
+        if not hasattr(st, "secrets"):
+            return
+        for k, v in st.secrets.items():
+            if isinstance(v, (str, int, float, bool)):
+                os.environ.setdefault(str(k), str(v))
+        creds_path = os.getenv("GOOGLE_CREDS_FILE", "credentials.json").strip() or "credentials.json"
+        if not os.path.exists(creds_path):
+            if "GOOGLE_CREDS_JSON" in st.secrets:
+                raw = st.secrets["GOOGLE_CREDS_JSON"]
+                data = json.loads(raw) if isinstance(raw, str) else dict(raw)
+                with open(creds_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+            elif "gcp_service_account" in st.secrets:
+                with open(creds_path, "w", encoding="utf-8") as f:
+                    json.dump(dict(st.secrets["gcp_service_account"]), f)
+    except Exception:
+        pass
+
+
+_load_streamlit_secrets()
 
 
 def env(key, default=""):
@@ -345,15 +373,18 @@ def parse_input(text, default_date):
         return val
 
     marks = [m.start() for m in re.finditer("🏠", text)]
+    if not marks:
+        marks = [m.start() for m in re.finditer(r"(?m)^[ \t]*(?:[-•*]\s*)?INC\d+", text, re.I)]
+
     tickets = []
     for k, pos in enumerate(marks):
         end = marks[k + 1] if k + 1 < len(marks) else len(text)
         b = text[pos:end]
-        inc = re.search(r"INC\d+", b)
+        inc = re.search(r"INC\d+", b, re.I)
         url = re.search(r"https?://[^\s\"”]+", b)
         before_cp = re.split(r"CP[ \t]*:", b, maxsplit=1)[0]
         layanan = re.search(r"(?<![\w])(\d{8,16})(?![\w])", before_cp)
-        odp = re.search(r"ODP-[\w\-/]+", b)
+        odp = re.search(r"ODP-[\w\-/]+", b, re.I)
         name = re.search(r"CP[ \t]*:[ \t]*([^\n(]+)", b)
         phone = re.search(r"CP[ \t]*:[^\n]*?\([ \t]*\+?([\d \-]+?)[ \t]*\)", b)
         t_date = last(
@@ -369,9 +400,9 @@ def parse_input(text, default_date):
             tickets.append({
                 "inc": "-",
                 "layanan": layanan.group(1) if layanan else "-",
-                "odp": odp.group(0) if odp else "-",
-                "name": name.group(1).strip() if name else "-",
-                "phone": phone.group(1).replace(" ", "") if phone else "-",
+                "odp": odp.group(0).upper() if odp else "-",
+                "name": name.group(1).strip() if name and name.group(1).strip() else "-",
+                "phone": phone.group(1).replace(" ", "") if phone and phone.group(1).strip() else "-",
                 "url": url.group(0) if url else "",
                 "ticket_date": t_date,
                 "jenis": t_jenis,
@@ -386,11 +417,11 @@ def parse_input(text, default_date):
             continue
 
         tickets.append({
-            "inc": inc.group(0),
+            "inc": inc.group(0).upper(),
             "layanan": layanan.group(1) if layanan else "-",
-            "odp": odp.group(0) if odp else "-",
-            "name": name.group(1).strip() if name else "-",
-            "phone": phone.group(1).replace(" ", "") if phone else "-",
+            "odp": odp.group(0).upper() if odp else "-",
+            "name": name.group(1).strip() if name and name.group(1).strip() else "-",
+            "phone": phone.group(1).replace(" ", "") if phone and phone.group(1).strip() else "-",
             "url": url.group(0) if url else "",
             "ticket_date": t_date,
             "jenis": t_jenis,
@@ -672,7 +703,9 @@ def path_len(start, order):
     """Hitung panjang total jalur (km) dari start melewati urutan tiket."""
     if not order:
         return 0.0
-    pts = [start] + [t["coord"] for t in order]
+    pts = [start] + [t["coord"] for t in order if t.get("coord") is not None]
+    if len(pts) <= 1:
+        return 0.0
     return sum(hav(pts[i], pts[i + 1]) for i in range(len(pts) - 1))
 
 
@@ -1477,3 +1510,524 @@ async def process(tickets):
                 dist_matrices[d] = dm
                 if fb:
                     any_fallback = True
+
+    await asyncio.to_thread(store.save, new_rows, updates, logs)
+    await asyncio.to_thread(store.add_kendala, kendala_rows)
+    for r_inc, r_jenis in resolve_ops:
+        await asyncio.to_thread(store.resolve_kendala, r_inc, r_jenis, now)
+
+    open_kendala = [k for k in kendala_rows if k.get("status") == "OPEN"]
+    blocks = build_report(items, start, dist_matrices=dist_matrices, is_fallback=any_fallback)
+    return blocks, items, skipped, failed, open_kendala
+
+
+# ================================================================ Telegram UI
+MENU_ADD = "➕ Add Tiket"
+MENU_CLOSE = "✅ Close Ticket"
+MENU_AKTIF = "📋 Tiket Aktif"
+MENU_KENDALA = "⚠️ Kendala"
+MENU_RE = "^(" + "|".join(re.escape(x) for x in (MENU_ADD, MENU_CLOSE, MENU_AKTIF, MENU_KENDALA)) + ")$"
+MAIN_KB = ReplyKeyboardMarkup(
+    [[MENU_ADD, MENU_CLOSE], [MENU_AKTIF, MENU_KENDALA]],
+    resize_keyboard=True,
+)
+U = filters.User(user_id=ALLOWED)
+ADD_CONFIRM, ADD_WAIT, CLOSE_WAIT = range(3)
+INC_CMD_RE = r"(?i)^/INC\d+"
+
+
+def split_text(text, limit=3900, html_mode=False, max_entities=80):
+    def size(x):
+        return len(html.unescape(re.sub(r"<[^>]+>", "", x))) if html_mode else len(x)
+
+    def ents(x):
+        return len(re.findall(r"<(?:a|b)[ >]", x)) if html_mode else 0
+
+    def fits(x):
+        return size(x) <= limit and ents(x) <= max_entities
+
+    chunks, buf = [], ""
+    for para in (p for p in text.split("\n\n") if p.strip()):
+        cand = f"{buf}\n\n{para}" if buf else para
+        if fits(cand):
+            buf = cand
+            continue
+        if buf:
+            chunks.append(buf)
+        buf = ""
+        if fits(para):
+            buf = para
+            continue
+        for line in para.split("\n"):
+            cand = f"{buf}\n{line}" if buf else line
+            if not fits(cand) and buf:
+                chunks.append(buf)
+                buf = line
+            else:
+                buf = cand
+    if buf.strip():
+        chunks.append(buf)
+    return chunks
+
+
+async def send_long(msg, text, html_mode=False, **kw):
+    pm = ParseMode.HTML if html_mode else None
+    chunks = split_text(text, html_mode=html_mode)
+    for i, c in enumerate(chunks):
+        await msg.reply_text(
+            c, parse_mode=pm, disable_web_page_preview=True,
+            **(kw if i == len(chunks) - 1 else {}),
+        )
+
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 Bot Tiket Home Survey\n\n"
+        "/add_tiket - input tiket baru\n"
+        "/aktif - daftar tiket aktif + rute\n"
+        "/kendala - daftar tiket kendala lokasi/data\n"
+        "/close_ticket - tutup tiket (tap INC)",
+        reply_markup=MAIN_KB,
+    )
+
+
+# ---- add tiket
+async def add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["buf"] = []
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Ya, lanjut", callback_data="add_yes"),
+        InlineKeyboardButton("❌ Batal", callback_data="cancel"),
+    ]])
+    await update.message.reply_text(f"Input tiket baru (maks. {MAX_TICKETS} tiket). Lanjutkan?", reply_markup=kb)
+    return ADD_CONFIRM
+
+
+async def add_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        f"Paste tiketnya sekarang (maks. {MAX_TICKETS}).\n\n"
+        "Telegram membatasi 4096 karakter/pesan, jadi kirim bertahap jika banyak, "
+        "lalu tekan ✅ Proses."
+    )
+    return ADD_WAIT
+
+
+async def add_receive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    today = datetime.now(TZ).strftime("%d-%m-%Y")
+    tickets = parse_input(update.message.text, today)
+    if not tickets:
+        await update.message.reply_text("Tiket tidak terbaca. Pastikan ada blok tiket (🏠 / INC...).")
+        return ADD_WAIT
+
+    buf = ctx.user_data.setdefault("buf", [])
+    seen = {t["inc"] for t in buf if t.get("inc") and t["inc"] != "-"}
+    added = 0
+    for t in tickets:
+        inc = t.get("inc") or "-"
+        if inc != "-" and inc in seen:
+            continue
+        if len(buf) >= MAX_TICKETS:
+            break
+        buf.append(t)
+        if inc != "-":
+            seen.add(inc)
+        added += 1
+
+    full = " Batas maksimal tercapai." if len(buf) >= MAX_TICKETS else ""
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Proses", callback_data="add_process"),
+        InlineKeyboardButton("❌ Batal", callback_data="cancel"),
+    ]])
+    await update.message.reply_text(
+        f"Diterima {added} tiket (total {len(buf)}/{MAX_TICKETS}).{full}\n\n"
+        "Kirim lagi atau tekan Proses.",
+        reply_markup=kb,
+    )
+    return ADD_WAIT
+
+
+async def add_process(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    buf = ctx.user_data.pop("buf", [])
+    if not buf:
+        await q.edit_message_text("Belum ada tiket. Gunakan /add_tiket lagi.")
+        return ConversationHandler.END
+    await q.edit_message_text(f"⏳ Memproses {len(buf)} tiket (pencarian alamat & rute OSRM)...")
+    try:
+        blocks, items, skipped, failed, open_kendala = await process(buf)
+    except Exception as e:
+        log.exception("process gagal")
+        await q.message.reply_text(f"❌ Error: {e}", reply_markup=MAIN_KB)
+        return ConversationHandler.END
+
+    n_baru = sum(t["status"] == "BARU" for t in items)
+    n_lama = sum(t["status"] == "LAMA" for t in items)
+    n_noloc = sum(t.get("coord") is None for t in items)
+    await q.message.reply_text(
+        "✅ Selesai diproses\n\n"
+        f"🆕 Baru: {n_baru} | ♻️ Sudah aktif (duplikat diabaikan): {n_lama}\n"
+        f"❓ Tanpa lokasi (di urutan atas): {n_noloc}\n"
+        f"⚠️ Kendala dicatat: {len(open_kendala)} (cek /kendala)\n"
+        f"⛔ Sudah selesai (dilewati): {len(skipped)}"
+    )
+    for b in blocks:
+        await send_long(q.message, b, html_mode=True)
+
+    extra = []
+    if skipped:
+        extra.append("\n".join(
+            ["⛔ Sudah pernah selesai (tidak diproses):"] + [f"- {t['inc']}" for t in skipped]
+        ))
+    if failed:
+        extra.append("\n".join(
+            ["❓ Tiket tanpa koordinat (tetap masuk Aktif di urutan atas & dicatat di Kendala):"]
+            + [f"- {t['inc']} ({t['url'] or 'tanpa link'})" for t in failed]
+        ))
+    if open_kendala:
+        extra.append("\n".join(
+            ["⚠️ Rincian kendala OPEN (ketik /kendala untuk daftar lengkap):"]
+            + [f"- {k['inc']} [{k['jenis_kendala']}]: {k['detail']}" for k in open_kendala]
+        ))
+    if extra:
+        await send_long(q.message, "\n\n".join(extra))
+    await q.message.reply_text("Data tersimpan di spreadsheet.", reply_markup=MAIN_KB)
+    return ConversationHandler.END
+
+
+# ---- close ticket
+def _format_close_list(order):
+    parts = []
+    for n, t in enumerate(order, 1):
+        tags = []
+        if t.get("coord") is None:
+            tags.append("❓ LOKASI KOSONG")
+        if t.get("is_far"):
+            tags.append("📌 JAUH")
+        tag_str = f"{' | '.join(tags)} | " if tags else ""
+        parts.append(
+            f"{n}. {tag_str}/{t['inc'].strip()}\n"
+            f"👤 {t['name']} | {t['odp']}\n"
+            f"📍 {t['address']}"
+        )
+    return "\n\n".join(parts)
+
+
+async def close_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        aktif = await asyncio.to_thread(store.load_aktif)
+    except Exception as e:
+        log.exception("load aktif gagal")
+        await update.message.reply_text(f"❌ Error: {e}", reply_markup=MAIN_KB)
+        return ConversationHandler.END
+    if not aktif:
+        await update.message.reply_text("Tidak ada tiket aktif.", reply_markup=MAIN_KB)
+        return ConversationHandler.END
+
+    order = []
+    try:
+        async with httpx.AsyncClient(headers=UA) as client:
+            start = await get_start(client)
+            order = await get_ordered_aktif_items(aktif, start, client=client)
+    except Exception:
+        log.exception("gagal mengurutkan daftar close_ticket, fallback tanggal")
+
+    await update.message.reply_text(
+        f"📋 {len(aktif)} tiket aktif (tanpa lokasi paling atas, dilanjut rute OSRM)\n\n"
+        "Tap INC berwarna biru untuk menutup tiket, atau ketik nomor INC manual "
+        "(boleh banyak).\n\nBatal: /cancel"
+    )
+    if order:
+        await send_long(update.message, _format_close_list(order))
+    else:
+        groups = {}
+        for a in aktif.values():
+            d = norm_date(a["ticket_date"], norm_date(a["received_at"], "-"))
+            groups.setdefault(d, []).append(a)
+        parts = []
+        for d in sorted(groups, key=date_key):
+            parts.append(f"📅 {d}")
+            for a in groups[d]:
+                parts.append(f"/{a['inc'].strip()}\n👤 {a['nama'] or '-'} | {a['odp'] or '-'}")
+        await send_long(update.message, "\n\n".join(parts))
+    return CLOSE_WAIT
+
+
+async def close_receive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    incs = list(dict.fromkeys(re.findall(r"INC\d+", update.message.text.upper())))
+    if not incs:
+        await update.message.reply_text("Format INC tidak dikenali. Contoh: INC53101831")
+        return CLOSE_WAIT
+    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        aktif_now = await asyncio.to_thread(store.load_aktif)
+        addr_overrides = {}
+        start = None
+        next_order = []
+        async with httpx.AsyncClient(headers=UA) as client:
+            try:
+                start = await get_start(client)
+            except Exception:
+                pass
+            for inc in incs:
+                if inc not in aktif_now:
+                    continue
+                row = aktif_now[inc]
+                if needs_full_address(row.get("alamat", "")):
+                    coord = None
+                    try:
+                        if str(row.get("lat", "")).strip() and str(row.get("lng", "")).strip():
+                            coord = (to_float(row["lat"]), to_float(row["lng"]))
+                    except ValueError:
+                        coord = None
+                    if not coord:
+                        coord = await resolve_coord(client, row.get("link_maps", ""))
+                    if coord:
+                        full_addr = await reverse_geocode(client, *coord, row.get("link_maps", ""))
+                        if full_addr and full_addr != "(alamat tidak ditemukan)":
+                            addr_overrides[inc] = full_addr
+
+            found, missing, sisa_aktif = await asyncio.to_thread(store.close, incs, now, addr_overrides)
+            if sisa_aktif and start:
+                next_order = await get_ordered_aktif_items(sisa_aktif, start, client=client)
+    except Exception as e:
+        log.exception("close gagal")
+        await update.message.reply_text(f"❌ Error: {e}", reply_markup=MAIN_KB)
+        return ConversationHandler.END
+
+    status = []
+    if found:
+        msg_done = f"✅ {', '.join(d['inc'] for d in found)} dipindah ke tab Selesai.\nSisa tiket aktif: {len(sisa_aktif)}"
+        if next_order:
+            nxt = next_order[0]
+            msg_done += f"\n\n➡️ Lanjut #1 berikutnya: /{nxt['inc']} — {nxt['name']}\n📍 {nxt['address']}"
+        status.append(msg_done)
+    if missing:
+        status.append("⚠️ Tidak ada di tiket aktif: " + ", ".join(missing))
+    await update.message.reply_text("\n\n".join(status), reply_markup=MAIN_KB)
+
+    for d in found:
+        await update.message.reply_text(d["alamat"] or "-")
+        await update.message.reply_text(close_template(d))
+    return ConversationHandler.END
+
+
+# ---- batal
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.pop("buf", None)
+    await update.effective_message.reply_text("Dibatalkan.", reply_markup=MAIN_KB)
+    return ConversationHandler.END
+
+
+async def cancel_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data.pop("buf", None)
+    await q.edit_message_text("Dibatalkan.")
+    return ConversationHandler.END
+
+
+# ---- tiket aktif
+async def show_aktif(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    try:
+        aktif = await asyncio.to_thread(store.load_aktif)
+        if not aktif:
+            await msg.reply_text("Tidak ada tiket aktif.", reply_markup=MAIN_KB)
+            return
+        items = []
+        for a in aktif.values():
+            it = row_to_item(a)
+            it["status"] = "AKTIF"
+            items.append(it)
+        await msg.reply_text(f"📋 {len(items)} tiket aktif:")
+        async with httpx.AsyncClient(headers=UA) as client:
+            start = await get_start(client)
+            located = [t for t in items if t.get("coord") is not None]
+            dm, fb = None, False
+            if located:
+                pts = [start] + [t["coord"] for t in located]
+                dm, fb = await road_matrix(client, pts)
+        await send_long(msg, build_aktif_report(items, start, dist_matrix=dm, is_fallback=fb), html_mode=True)
+    except Exception as e:
+        log.exception("aktif gagal")
+        await msg.reply_text(f"❌ Error /aktif: {e}")
+
+
+# ---- kendala
+async def show_kendala(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    e = html.escape
+    try:
+        open_rows = await asyncio.to_thread(store.load_kendala, "OPEN")
+        aktif_map = await asyncio.to_thread(store.load_aktif)
+
+        # Pastikan tiket aktif yang lokasinya masih kosong selalu tampil meskipun belum ada di sheet Kendala
+        seen_loc_incs = {
+            r.get("inc") for r in open_rows
+            if r.get("jenis_kendala") in ("LOKASI_KOSONG", "LOKASI_GAGAL_DIBACA")
+        }
+        extra_rows = []
+        for inc, a in aktif_map.items():
+            it = row_to_item(a)
+            if it.get("coord") is None and inc not in seen_loc_incs:
+                has_url = bool(it.get("url"))
+                extra_rows.append({
+                    "logged_at": a.get("received_at") or "",
+                    "ticket_date": norm_date(a.get("ticket_date", ""), "-"),
+                    "inc": inc,
+                    "jenis_kendala": "LOKASI_GAGAL_DIBACA" if has_url else "LOKASI_KOSONG",
+                    "detail": f"Koordinat gagal dibaca: {it['url']}" if has_url else "Tiket tidak memiliki link lokasi",
+                    "odp": it.get("odp") or "-",
+                    "nama": it.get("name") or "-",
+                    "telepon": it.get("phone") or "-",
+                    "layanan": it.get("layanan") or "-",
+                    "link_maps": it.get("url") or "-",
+                    "status": "OPEN",
+                })
+
+        all_open = open_rows + extra_rows
+        if not all_open:
+            await msg.reply_text("✅ Tidak ada tiket kendala (OPEN) saat ini.", reply_markup=MAIN_KB)
+            return
+
+        priority = {
+            "LOKASI_KOSONG": 0,
+            "LOKASI_GAGAL_DIBACA": 1,
+            "ALAMAT_TIDAK_DITEMUKAN": 2,
+            "KONTAK_KOSONG": 3,
+            "FORMAT_TIKET_RUSAK": 4,
+            "ERROR_LAINNYA": 5,
+        }
+        all_open.sort(
+            key=lambda d: (
+                priority.get(d.get("jenis_kendala", ""), 9),
+                date_key(norm_date(d.get("ticket_date", ""), "")),
+                d.get("inc", ""),
+            )
+        )
+
+        paras = [f"⚠️ <b>Daftar Tiket Kendala OPEN ({len(all_open)} item)</b>"]
+        for n, d in enumerate(all_open, 1):
+            inc = (d.get("inc") or "-").strip()
+            jk = d.get("jenis_kendala") or "-"
+            det = d.get("detail") or "-"
+            link = (d.get("link_maps") or "").strip()
+            tap_inc = f"/{inc}" if inc != "-" and inc in aktif_map else inc
+            link_line = (
+                f'   🔗 <a href="{e(link)}">Cek Link Mentah</a>'
+                if link and link != "-"
+                else "   🔗 Link lokasi: <i>tidak ada</i>"
+            )
+            paras.append("\n".join([
+                f"{n}. <b>{e(tap_inc)}</b> | {e(d.get('odp') or '-')}",
+                f"   ⚠️ <b>{e(jk)}</b>: {e(det)}",
+                f"   📅 {e(norm_date(d.get('ticket_date', ''), '-'))} | Layanan: {e(d.get('layanan') or '-')}",
+                f"   👤 {e(d.get('nama') or '-')} ({e(d.get('telepon') or '-')})",
+                link_line,
+            ]))
+
+        await send_long(msg, "\n\n".join(paras), html_mode=True)
+    except Exception as err:
+        log.exception("kendala gagal")
+        await msg.reply_text(f"❌ Error /kendala: {err}")
+
+
+async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
+    log.error("Unhandled error", exc_info=ctx.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(f"❌ Error: {ctx.error}")
+        except Exception:
+            pass
+
+
+async def post_init(app: Application):
+    await app.bot.set_my_commands([
+        BotCommand("start", "Menu utama bot"),
+        BotCommand("add_tiket", "Input tiket baru"),
+        BotCommand("aktif", "Daftar tiket aktif & rute OSRM"),
+        BotCommand("kendala", "Daftar tiket kendala lokasi & data"),
+        BotCommand("close_ticket", "Tutup tiket (tap INC)"),
+        BotCommand("cancel", "Batalkan proses saat ini"),
+    ])
+
+
+def _build_application():
+    global store
+    store = Store()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+
+    non_menu_text = U & filters.TEXT & ~filters.COMMAND & ~filters.Regex(MENU_RE)
+    conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("add_tiket", add_start, filters=U),
+            MessageHandler(U & filters.Regex(f"^{re.escape(MENU_ADD)}$"), add_start),
+            CommandHandler("close_ticket", close_start, filters=U),
+            MessageHandler(U & filters.Regex(f"^{re.escape(MENU_CLOSE)}$"), close_start),
+        ],
+        states={
+            ADD_CONFIRM: [
+                CallbackQueryHandler(add_yes, pattern="^add_yes$"),
+                CallbackQueryHandler(cancel_cb, pattern="^cancel$"),
+            ],
+            ADD_WAIT: [
+                MessageHandler(non_menu_text, add_receive),
+                CallbackQueryHandler(add_process, pattern="^add_process$"),
+                CallbackQueryHandler(cancel_cb, pattern="^cancel$"),
+            ],
+            CLOSE_WAIT: [
+                MessageHandler(U & filters.Regex(INC_CMD_RE), close_receive),
+                MessageHandler(non_menu_text, close_receive),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel, filters=U)],
+        allow_reentry=True,
+    )
+    app.add_handler(conv)
+    app.add_handler(MessageHandler(U & filters.Regex(INC_CMD_RE), close_receive))
+    app.add_handler(CommandHandler("start", cmd_start, filters=U))
+    app.add_handler(CommandHandler("aktif", show_aktif, filters=U))
+    app.add_handler(MessageHandler(U & filters.Regex(f"^{re.escape(MENU_AKTIF)}$"), show_aktif))
+    app.add_handler(CommandHandler("kendala", show_kendala, filters=U))
+    app.add_handler(MessageHandler(U & filters.Regex(f"^{re.escape(MENU_KENDALA)}$"), show_kendala))
+    app.add_error_handler(on_error)
+    return app
+
+
+def main():
+    app = _build_application()
+    app.run_polling()
+
+
+def _is_streamlit_runtime():
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+
+if __name__ == "__main__":
+    if _is_streamlit_runtime():
+        import streamlit as st
+
+        @st.cache_resource
+        def _start_bot_daemon():
+            def _runner():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                app = _build_application()
+                app.run_polling(stop_signals=None)
+
+            t = threading.Thread(target=_runner, daemon=True, name="telegram-bot-polling")
+            t.start()
+            return t
+
+        _start_bot_daemon()
+        st.set_page_config(page_title="Homeconnect Bot", page_icon="🤖")
+        st.title("🤖 Homeconnect Telegram Bot")
+        st.success("Status: Aktif & berjalan di latar belakang.")
+    else:
+        main()
